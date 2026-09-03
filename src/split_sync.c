@@ -108,18 +108,31 @@ static inline void sop_handle_cmd(uint8_t cmd) {
 
 #include <zmk/ble.h>
 
+enum sop_slot_phase {
+    SOP_SLOT_EMPTY,
+    SOP_SLOT_WAIT_SECURITY,
+    SOP_SLOT_DISCOVERY_READY,
+    SOP_SLOT_DISCOVERING_SERVICE,
+    SOP_SLOT_DISCOVERING_CHARACTERISTIC,
+    SOP_SLOT_SUBSCRIPTION_READY,
+    SOP_SLOT_SUBSCRIBING,
+    SOP_SLOT_SUBSCRIBED,
+};
+
 struct sop_peripheral_slot {
+    /* The slot owns this reference until the matching disconnect callback. */
     struct bt_conn *conn;
+    uint32_t generation;
+    enum sop_slot_phase phase;
     uint16_t off_handle;
-    bool discovering;
-    bool subscribing;
-    bool subscribed;
+    uint32_t retry_ms;
     struct bt_gatt_discover_params discover_params;
     struct bt_gatt_discover_params sub_discover_params;
     struct bt_gatt_subscribe_params subscribe_params;
 };
 
 static struct sop_peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static struct k_spinlock sop_slots_lock;
 
 static const struct bt_uuid_128 sop_service_uuid = BT_UUID_INIT_128(ZMK_SOFT_OFF_PLUS_SVC_UUID);
 
@@ -128,9 +141,18 @@ static K_WORK_DELAYABLE_DEFINE(sop_discover_work, sop_discover_work_cb);
 
 /* Long enough for ZMK's own connect-time discovery to finish and free the ATT
  * bearer before we (re)try ours. */
-#define SOP_DISCOVER_RETRY_MS 500
+#define SOP_DISCOVER_RETRY_MS 500U
+#define SOP_DISCOVER_RETRY_MAX_MS 5000U
 
-static struct sop_peripheral_slot *sop_slot_for_conn(struct bt_conn *conn) {
+struct sop_slot_snapshot {
+    struct bt_conn *conn;
+    uint32_t generation;
+    enum sop_slot_phase phase;
+    uint16_t off_handle;
+};
+
+/* The caller must hold sop_slots_lock. */
+static struct sop_peripheral_slot *sop_slot_for_conn_locked(struct bt_conn *conn) {
     if (!conn) {
         return NULL;
     }
@@ -143,49 +165,81 @@ static struct sop_peripheral_slot *sop_slot_for_conn(struct bt_conn *conn) {
     return NULL;
 }
 
-static struct sop_peripheral_slot *sop_reserve_slot(struct bt_conn *conn) {
-    for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
-        if (peripherals[i].conn == NULL) {
-            /* Start every connection with fresh GATT procedure state. In
-             * particular, Zephyr uses sub_discover_params.func as its
-             * "auto-CCC discovery in progress" marker, so it must not leak
-             * from a failed procedure on the previous connection. */
-            memset(&peripherals[i].discover_params, 0,
-                   sizeof(peripherals[i].discover_params));
-            memset(&peripherals[i].sub_discover_params, 0,
-                   sizeof(peripherals[i].sub_discover_params));
-            memset(&peripherals[i].subscribe_params, 0,
-                   sizeof(peripherals[i].subscribe_params));
-            peripherals[i].conn = conn;
-            peripherals[i].off_handle = 0;
-            peripherals[i].discovering = false;
-            peripherals[i].subscribing = false;
-            peripherals[i].subscribed = false;
-            return &peripherals[i];
-        }
+static bool sop_slot_matches_locked(struct sop_peripheral_slot *slot, struct bt_conn *conn,
+                                    uint32_t generation) {
+    return slot->conn == conn && slot->generation == generation;
+}
+
+static void sop_reset_retry_locked(struct sop_peripheral_slot *slot) {
+    slot->retry_ms = SOP_DISCOVER_RETRY_MS;
+}
+
+static uint32_t sop_next_retry_locked(struct sop_peripheral_slot *slot) {
+    uint32_t delay = slot->retry_ms ? slot->retry_ms : SOP_DISCOVER_RETRY_MS;
+
+    slot->retry_ms = MIN(delay * 2U, SOP_DISCOVER_RETRY_MAX_MS);
+    return delay;
+}
+
+static void sop_schedule_discovery(uint32_t delay_ms) {
+    k_work_reschedule(&sop_discover_work, K_MSEC(delay_ms));
+}
+
+/* Take a short-lived connection reference while still holding the slot lock.
+ * This closes the check/use window with the disconnect callback; callers may
+ * then use the snapshot without keeping the lock across Bluetooth APIs. */
+static bool sop_snapshot_slot(int index, struct sop_slot_snapshot *snapshot) {
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = &peripherals[index];
+
+    if (slot->conn == NULL) {
+        k_spin_unlock(&sop_slots_lock, key);
+        return false;
     }
-    return NULL;
+
+    snapshot->conn = bt_conn_ref(slot->conn);
+    if (snapshot->conn == NULL) {
+        k_spin_unlock(&sop_slots_lock, key);
+        return false;
+    }
+    snapshot->generation = slot->generation;
+    snapshot->phase = slot->phase;
+    snapshot->off_handle = slot->off_handle;
+    k_spin_unlock(&sop_slots_lock, key);
+    return true;
 }
 
 static uint8_t sop_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                              const void *data, uint16_t length) {
-    if (!data) {
-        struct sop_peripheral_slot *slot = sop_slot_for_conn(conn);
-        if (slot) {
-            slot->subscribing = false;
-            slot->subscribed = false;
-            /* A NULL notification means that the subscription was removed or
-             * its CCC could not be discovered. Keep the value handle for the
-             * central->peripheral write path, but rediscover the CCC and retry
-             * the peripheral->central notification path. */
-            params->ccc_handle = 0U;
-            params->value_handle = slot->off_handle;
-            params->value = BT_GATT_CCC_NOTIFY;
-            k_work_reschedule(&sop_discover_work, K_MSEC(SOP_DISCOVER_RETRY_MS));
-        }
+    uint32_t retry_delay = 0U;
+    bool accept_command = false;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+
+    if (slot == NULL || params != &slot->subscribe_params) {
+        k_spin_unlock(&sop_slots_lock, key);
         return BT_GATT_ITER_STOP;
     }
-    if (length >= 1) {
+
+    if (!data) {
+        /* A NULL notification means that the subscription was removed or its
+         * CCC could not be discovered. Keep the value handle for the
+         * central->peripheral write path, but rediscover the CCC and retry the
+         * peripheral->central notification path. */
+        slot->phase = slot->off_handle ? SOP_SLOT_SUBSCRIPTION_READY : SOP_SLOT_DISCOVERY_READY;
+        params->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+        params->value_handle = slot->off_handle;
+        params->value = BT_GATT_CCC_NOTIFY;
+        retry_delay = sop_next_retry_locked(slot);
+        k_spin_unlock(&sop_slots_lock, key);
+        sop_schedule_discovery(retry_delay);
+        return BT_GATT_ITER_STOP;
+    }
+
+    accept_command = slot->phase == SOP_SLOT_SUBSCRIBING || slot->phase == SOP_SLOT_SUBSCRIBED;
+    k_spin_unlock(&sop_slots_lock, key);
+
+    if (accept_command && length >= 1) {
         sop_handle_cmd(((const uint8_t *)data)[0]);
     }
     return BT_GATT_ITER_CONTINUE;
@@ -193,23 +247,45 @@ static uint8_t sop_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_para
 
 static void sop_subscribe_cb(struct bt_conn *conn, uint8_t err,
                              struct bt_gatt_subscribe_params *params) {
-    ARG_UNUSED(params);
-    struct sop_peripheral_slot *slot = sop_slot_for_conn(conn);
-    if (!slot) {
+    uint32_t retry_delay = 0U;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+
+    if (slot == NULL || params != &slot->subscribe_params ||
+        slot->phase != SOP_SLOT_SUBSCRIBING) {
+        k_spin_unlock(&sop_slots_lock, key);
         return;
     }
 
-    slot->subscribing = false;
-    slot->subscribed = (err == 0U);
+    if (err) {
+        slot->phase = SOP_SLOT_SUBSCRIPTION_READY;
+        retry_delay = sop_next_retry_locked(slot);
+    } else {
+        slot->phase = SOP_SLOT_SUBSCRIBED;
+        sop_reset_retry_locked(slot);
+    }
+    k_spin_unlock(&sop_slots_lock, key);
+
     if (err) {
         LOG_WRN("soft-off-plus: subscribe response failed (ATT 0x%02x); retrying", err);
-        k_work_reschedule(&sop_discover_work, K_MSEC(SOP_DISCOVER_RETRY_MS));
+        sop_schedule_discovery(retry_delay);
     } else {
         LOG_DBG("soft-off-plus: peripheral notification subscription ready");
     }
 }
 
-static void sop_begin_subscription(struct sop_peripheral_slot *slot) {
+static uint32_t sop_begin_subscription(int index, const struct sop_slot_snapshot *snapshot) {
+    struct bt_gatt_subscribe_params *params;
+    uint32_t retry_delay = 0U;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = &peripherals[index];
+
+    if (!sop_slot_matches_locked(slot, snapshot->conn, snapshot->generation) ||
+        slot->phase != SOP_SLOT_SUBSCRIPTION_READY) {
+        k_spin_unlock(&sop_slots_lock, key);
+        return 0U;
+    }
+
     /* Always start a fresh automatic CCC discovery. If bt_gatt_discover()
      * fails synchronously (usually -EBUSY), Zephyr leaves disc_params->func
      * set to its internal discovery callback; without clearing it, every
@@ -229,131 +305,249 @@ static void sop_begin_subscription(struct sop_peripheral_slot *slot) {
     atomic_set_bit(slot->subscribe_params.flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
     atomic_clear_bit(slot->subscribe_params.flags, BT_GATT_SUBSCRIBE_FLAG_NO_RESUB);
 
-    slot->subscribing = true;
-    int err = bt_gatt_subscribe(slot->conn, &slot->subscribe_params);
+    slot->phase = SOP_SLOT_SUBSCRIBING;
+    params = &slot->subscribe_params;
+    k_spin_unlock(&sop_slots_lock, key);
+
+    /* bt_gatt_subscribe() may invoke params->notify synchronously, so no slot
+     * lock may be held across this call. The snapshot owns a temporary conn
+     * reference for the entire operation. */
+    int err = bt_gatt_subscribe(snapshot->conn, params);
     if (err == -EALREADY) {
-        /* The same live subscription is already registered. */
-        slot->subscribing = false;
-        slot->subscribed = true;
+        key = k_spin_lock(&sop_slots_lock);
+        if (sop_slot_matches_locked(slot, snapshot->conn, snapshot->generation) &&
+            slot->phase == SOP_SLOT_SUBSCRIBING) {
+            /* The same live subscription is already registered. */
+            slot->phase = SOP_SLOT_SUBSCRIBED;
+            sop_reset_retry_locked(slot);
+        }
+        k_spin_unlock(&sop_slots_lock, key);
     } else if (err) {
-        slot->subscribing = false;
-        slot->subscribed = false;
-        /* Clear Zephyr's auto-discovery in-progress marker after a synchronous
-         * failure so the delayed work can make a genuinely fresh attempt. */
-        memset(&slot->sub_discover_params, 0, sizeof(slot->sub_discover_params));
-        slot->subscribe_params.ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+        key = k_spin_lock(&sop_slots_lock);
+        if (sop_slot_matches_locked(slot, snapshot->conn, snapshot->generation) &&
+            slot->phase == SOP_SLOT_SUBSCRIBING) {
+            slot->phase = SOP_SLOT_SUBSCRIPTION_READY;
+            /* Clear Zephyr's auto-discovery in-progress marker after a
+             * synchronous failure so the delayed work can make a genuinely
+             * fresh attempt. */
+            memset(&slot->sub_discover_params, 0, sizeof(slot->sub_discover_params));
+            slot->subscribe_params.ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+            retry_delay = sop_next_retry_locked(slot);
+        }
+        k_spin_unlock(&sop_slots_lock, key);
         LOG_WRN("soft-off-plus: subscribe failed (%d); retrying", err);
     }
+
+    return retry_delay;
 }
 
 static uint8_t sop_chrc_discovery_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                      struct bt_gatt_discover_params *params) {
-    ARG_UNUSED(params);
-    struct sop_peripheral_slot *slot = sop_slot_for_conn(conn);
-    if (!slot) {
-        return BT_GATT_ITER_STOP;
+    uint32_t retry_delay = 0U;
+    uint16_t off_handle = 0U;
+    bool found = false;
+    bool exhausted = attr == NULL || attr->user_data == NULL;
+
+    if (!exhausted) {
+        const struct bt_uuid *chrc_uuid = ((struct bt_gatt_chrc *)attr->user_data)->uuid;
+        found = bt_uuid_cmp(chrc_uuid, BT_UUID_DECLARE_128(ZMK_SOFT_OFF_PLUS_CHRC_UUID)) == 0;
+        if (found) {
+            off_handle = bt_gatt_attr_value_handle(attr);
+        }
     }
-    if (!attr || !attr->user_data) {
-        /* Walked the whole service without finding our characteristic; let the
-         * work item decide whether to retry. */
-        slot->discovering = false;
+
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+    if (slot == NULL || params != &slot->discover_params ||
+        slot->phase != SOP_SLOT_DISCOVERING_CHARACTERISTIC) {
+        k_spin_unlock(&sop_slots_lock, key);
         return BT_GATT_ITER_STOP;
     }
 
-    const struct bt_uuid *chrc_uuid = ((struct bt_gatt_chrc *)attr->user_data)->uuid;
-    if (bt_uuid_cmp(chrc_uuid, BT_UUID_DECLARE_128(ZMK_SOFT_OFF_PLUS_CHRC_UUID)) != 0) {
+    if (exhausted) {
+        /* Walked the whole service without finding our characteristic; let the
+         * work item decide whether to retry. */
+        slot->phase = SOP_SLOT_DISCOVERY_READY;
+        retry_delay = sop_next_retry_locked(slot);
+        k_spin_unlock(&sop_slots_lock, key);
+        sop_schedule_discovery(retry_delay);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (!found) {
         /* Not ours; keep walking the rest of the service's characteristics. */
+        k_spin_unlock(&sop_slots_lock, key);
         return BT_GATT_ITER_CONTINUE;
     }
 
-    slot->off_handle = bt_gatt_attr_value_handle(attr);
-    slot->discovering = false;
-    slot->subscribed = false;
+    slot->off_handle = off_handle;
+    slot->phase = SOP_SLOT_SUBSCRIPTION_READY;
+    sop_reset_retry_locked(slot);
+    k_spin_unlock(&sop_slots_lock, key);
 
     LOG_DBG("soft-off-plus: discovered peripheral off characteristic (handle %u)",
-            slot->off_handle);
+            off_handle);
     /* Do not start automatic CCC discovery from inside this characteristic
      * discovery callback: the ATT discovery procedure is still active until
      * this callback returns, so the nested bt_gatt_discover() gets -EBUSY and
      * poisons Zephyr's auto-discovery state. The retrying work item will start
      * the subscription after this procedure has completed. */
+    sop_schedule_discovery(1U);
     return BT_GATT_ITER_STOP;
 }
 
 static uint8_t sop_service_discovery_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                         struct bt_gatt_discover_params *params) {
-    ARG_UNUSED(params);
-    struct sop_peripheral_slot *slot = sop_slot_for_conn(conn);
-    if (!slot) {
-        return BT_GATT_ITER_STOP;
+    uint32_t generation;
+    uint32_t retry_delay = 0U;
+    bool exhausted = attr == NULL || attr->user_data == NULL;
+    uint16_t start_handle = 0U;
+    uint16_t end_handle = 0U;
+
+    if (!exhausted) {
+        const struct bt_gatt_service_val *svc = attr->user_data;
+        start_handle = attr->handle + 1U;
+        end_handle = svc->end_handle;
     }
-    if (!attr || !attr->user_data) {
-        slot->discovering = false;
+
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+    if (slot == NULL || params != &slot->discover_params ||
+        slot->phase != SOP_SLOT_DISCOVERING_SERVICE) {
+        k_spin_unlock(&sop_slots_lock, key);
         return BT_GATT_ITER_STOP;
     }
 
-    const struct bt_gatt_service_val *svc = attr->user_data;
+    if (exhausted) {
+        slot->phase = SOP_SLOT_DISCOVERY_READY;
+        retry_delay = sop_next_retry_locked(slot);
+        k_spin_unlock(&sop_slots_lock, key);
+        sop_schedule_discovery(retry_delay);
+        return BT_GATT_ITER_STOP;
+    }
 
     /* Constrain the characteristic walk to this service's handle range. A bare
      * 0x0001..0xffff walk would hit the GAP/GATT characteristics first and stop
      * there, so our characteristic would never be found. */
     slot->discover_params.uuid = NULL;
     slot->discover_params.func = sop_chrc_discovery_cb;
-    slot->discover_params.start_handle = attr->handle + 1;
-    slot->discover_params.end_handle = svc->end_handle;
+    slot->discover_params.start_handle = start_handle;
+    slot->discover_params.end_handle = end_handle;
     slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+    slot->phase = SOP_SLOT_DISCOVERING_CHARACTERISTIC;
+    generation = slot->generation;
+    k_spin_unlock(&sop_slots_lock, key);
 
-    int err = bt_gatt_discover(conn, &slot->discover_params);
+    /* The discovery callback can be invoked synchronously. */
+    int err = bt_gatt_discover(conn, params);
     if (err) {
+        key = k_spin_lock(&sop_slots_lock);
+        slot = sop_slot_for_conn_locked(conn);
+        if (slot != NULL && slot->generation == generation &&
+            slot->phase == SOP_SLOT_DISCOVERING_CHARACTERISTIC) {
+            slot->phase = SOP_SLOT_DISCOVERY_READY;
+            retry_delay = sop_next_retry_locked(slot);
+        }
+        k_spin_unlock(&sop_slots_lock, key);
         LOG_WRN("soft-off-plus: characteristic discovery failed (%d)", err);
-        slot->discovering = false; /* allow the work item to retry */
+        if (retry_delay != 0U) {
+            sop_schedule_discovery(retry_delay);
+        }
     }
     return BT_GATT_ITER_STOP;
 }
 
-static void sop_begin_discovery(struct sop_peripheral_slot *slot) {
+static uint32_t sop_begin_discovery(int index, const struct sop_slot_snapshot *snapshot) {
+    struct bt_gatt_discover_params *params;
+    uint32_t retry_delay = 0U;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = &peripherals[index];
+
+    if (!sop_slot_matches_locked(slot, snapshot->conn, snapshot->generation) ||
+        slot->phase != SOP_SLOT_DISCOVERY_READY) {
+        k_spin_unlock(&sop_slots_lock, key);
+        return 0U;
+    }
+
     slot->discover_params.uuid = &sop_service_uuid.uuid;
     slot->discover_params.func = sop_service_discovery_cb;
     slot->discover_params.start_handle = 0x0001;
     slot->discover_params.end_handle = 0xffff;
     slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+    slot->phase = SOP_SLOT_DISCOVERING_SERVICE;
+    params = &slot->discover_params;
+    k_spin_unlock(&sop_slots_lock, key);
 
-    int err = bt_gatt_discover(slot->conn, &slot->discover_params);
+    /* Discovery callbacks may run synchronously, so the slot lock is released
+     * before entering the Bluetooth stack. */
+    int err = bt_gatt_discover(snapshot->conn, params);
     if (err) {
+        key = k_spin_lock(&sop_slots_lock);
+        if (sop_slot_matches_locked(slot, snapshot->conn, snapshot->generation) &&
+            slot->phase == SOP_SLOT_DISCOVERING_SERVICE) {
+            slot->phase = SOP_SLOT_DISCOVERY_READY;
+            retry_delay = sop_next_retry_locked(slot);
+        }
+        k_spin_unlock(&sop_slots_lock, key);
         /* Most likely -EBUSY while ZMK's own discovery runs; the work item
-         * reschedules itself and we try again. */
+         * backs off and tries again. */
         LOG_DBG("soft-off-plus: service discovery busy (%d), will retry", err);
-        return;
     }
-    slot->discovering = true;
+
+    return retry_delay;
 }
 
 static void sop_discover_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
-    bool pending = false;
+    uint32_t next_retry = 0U;
 
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
-        struct sop_peripheral_slot *slot = &peripherals[i];
-        if (slot->conn == NULL || slot->subscribed) {
+        struct sop_slot_snapshot snapshot;
+        uint32_t retry_delay = 0U;
+
+        if (!sop_snapshot_slot(i, &snapshot)) {
             continue;
         }
-        pending = true;
-        if (bt_conn_get_security(slot->conn) < BT_SECURITY_L2) {
-            continue; /* wait until the inter-half link is encrypted */
-        }
-        if (slot->off_handle == 0) {
-            if (!slot->discovering) {
-                sop_begin_discovery(slot);
+
+        if (snapshot.phase == SOP_SLOT_WAIT_SECURITY) {
+            if (bt_conn_get_security(snapshot.conn) >= BT_SECURITY_L2) {
+                k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+                struct sop_peripheral_slot *slot = &peripherals[i];
+
+                if (sop_slot_matches_locked(slot, snapshot.conn, snapshot.generation) &&
+                    slot->phase == SOP_SLOT_WAIT_SECURITY) {
+                    slot->phase = SOP_SLOT_DISCOVERY_READY;
+                    sop_reset_retry_locked(slot);
+                    snapshot.phase = SOP_SLOT_DISCOVERY_READY;
+                }
+                k_spin_unlock(&sop_slots_lock, key);
+            } else {
+                k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+                struct sop_peripheral_slot *slot = &peripherals[i];
+
+                if (sop_slot_matches_locked(slot, snapshot.conn, snapshot.generation) &&
+                    slot->phase == SOP_SLOT_WAIT_SECURITY) {
+                    retry_delay = sop_next_retry_locked(slot);
+                }
+                k_spin_unlock(&sop_slots_lock, key);
             }
-            continue;
         }
-        if (!slot->subscribed && !slot->subscribing) {
-            sop_begin_subscription(slot);
+
+        if (snapshot.phase == SOP_SLOT_DISCOVERY_READY) {
+            retry_delay = sop_begin_discovery(i, &snapshot);
+        } else if (snapshot.phase == SOP_SLOT_SUBSCRIPTION_READY) {
+            retry_delay = sop_begin_subscription(i, &snapshot);
+        }
+
+        bt_conn_unref(snapshot.conn);
+
+        if (retry_delay != 0U && (next_retry == 0U || retry_delay < next_retry)) {
+            next_retry = retry_delay;
         }
     }
 
-    if (pending) {
-        k_work_reschedule(&sop_discover_work, K_MSEC(SOP_DISCOVER_RETRY_MS));
+    if (next_retry != 0U) {
+        sop_schedule_discovery(next_retry);
     }
 }
 
@@ -363,43 +557,100 @@ static void sop_connected(struct bt_conn *conn, uint8_t conn_err) {
         /* Only the inter-half link, on which we are the BLE central, matters. */
         return;
     }
-    if (sop_slot_for_conn(conn) != NULL) {
-        return; /* already tracked */
+
+    struct bt_conn *owned_conn = bt_conn_ref(conn);
+    if (owned_conn == NULL) {
+        LOG_WRN("soft-off-plus: failed to retain peripheral connection");
+        return;
     }
 
-    struct sop_peripheral_slot *slot = sop_reserve_slot(conn);
-    if (!slot) {
-        LOG_WRN("soft-off-plus: no free peripheral slot");
+    bool reserved = false;
+    bool already_tracked;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    already_tracked = sop_slot_for_conn_locked(conn) != NULL;
+    if (!already_tracked) {
+        for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
+            struct sop_peripheral_slot *slot = &peripherals[i];
+            if (slot->conn != NULL) {
+                continue;
+            }
+
+            /* Start every connection with fresh GATT procedure state. In
+             * particular, Zephyr uses sub_discover_params.func as its
+             * "auto-CCC discovery in progress" marker, so it must not leak
+             * from a failed procedure on the previous connection. */
+            memset(&slot->discover_params, 0, sizeof(slot->discover_params));
+            memset(&slot->sub_discover_params, 0, sizeof(slot->sub_discover_params));
+            memset(&slot->subscribe_params, 0, sizeof(slot->subscribe_params));
+            slot->generation++;
+            if (slot->generation == 0U) {
+                slot->generation = 1U;
+            }
+            slot->off_handle = 0U;
+            slot->phase = SOP_SLOT_WAIT_SECURITY;
+            sop_reset_retry_locked(slot);
+            slot->conn = owned_conn;
+            reserved = true;
+            break;
+        }
+    }
+    k_spin_unlock(&sop_slots_lock, key);
+
+    if (!reserved) {
+        bt_conn_unref(owned_conn);
+        if (!already_tracked) {
+            /* Keep the warning separate from the locked region. */
+            LOG_WRN("soft-off-plus: no free peripheral slot");
+        }
         return;
     }
 
     /* Defer discovery so it does not race ZMK's connect-time discovery. */
-    k_work_reschedule(&sop_discover_work, K_MSEC(SOP_DISCOVER_RETRY_MS));
+    sop_schedule_discovery(SOP_DISCOVER_RETRY_MS);
 }
 
 static void sop_security_changed(struct bt_conn *conn, bt_security_t level,
                                  enum bt_security_err err) {
-    ARG_UNUSED(level);
-    ARG_UNUSED(err);
+    bool ready = false;
+
     /* Once the link is encrypted, discovery can proceed; nudge the work item. */
-    if (sop_slot_for_conn(conn) != NULL) {
-        k_work_reschedule(&sop_discover_work, K_MSEC(50));
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+    if (slot != NULL && !err && level >= BT_SECURITY_L2 &&
+        slot->phase == SOP_SLOT_WAIT_SECURITY) {
+        slot->phase = SOP_SLOT_DISCOVERY_READY;
+        sop_reset_retry_locked(slot);
+        ready = true;
+    }
+    k_spin_unlock(&sop_slots_lock, key);
+
+    if (ready) {
+        sop_schedule_discovery(50U);
     }
 }
 
 static void sop_disconnected(struct bt_conn *conn, uint8_t reason) {
     ARG_UNUSED(reason);
-    struct sop_peripheral_slot *slot = sop_slot_for_conn(conn);
-    if (!slot) {
-        return;
+
+    struct bt_conn *owned_conn = NULL;
+    k_spinlock_key_t key = k_spin_lock(&sop_slots_lock);
+    struct sop_peripheral_slot *slot = sop_slot_for_conn_locked(conn);
+    if (slot != NULL) {
+        owned_conn = slot->conn;
+        slot->conn = NULL;
+        slot->generation++;
+        slot->phase = SOP_SLOT_EMPTY;
+        slot->off_handle = 0U;
+        sop_reset_retry_locked(slot);
     }
-    slot->conn = NULL;
-    slot->off_handle = 0;
-    slot->discovering = false;
-    slot->subscribing = false;
-    slot->subscribed = false;
-    slot->subscribe_params.value_handle = 0;
-    slot->subscribe_params.ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+    k_spin_unlock(&sop_slots_lock, key);
+
+    /* Zephyr has already torn down ATT requests and volatile subscriptions by
+     * this callback. Do not call GATT cancellation APIs here; simply release
+     * the slot's owning reference after invalidating every snapshot. */
+    if (owned_conn != NULL) {
+        bt_conn_unref(owned_conn);
+    }
 }
 
 static struct bt_conn_cb sop_conn_callbacks = {
@@ -418,12 +669,19 @@ static int sop_central_send(uint8_t cmd) {
     int sent = 0;
 
     for (int i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
-        struct sop_peripheral_slot *slot = &peripherals[i];
-        if (slot->conn == NULL || slot->off_handle == 0) {
+        struct sop_slot_snapshot snapshot;
+        if (!sop_snapshot_slot(i, &snapshot)) {
             continue;
         }
-        int err = bt_gatt_write_without_response(slot->conn, slot->off_handle, &cmd, sizeof(cmd),
-                                                 false);
+
+        if (snapshot.off_handle == 0U) {
+            bt_conn_unref(snapshot.conn);
+            continue;
+        }
+
+        int err = bt_gatt_write_without_response(snapshot.conn, snapshot.off_handle, &cmd,
+                                                 sizeof(cmd), false);
+        bt_conn_unref(snapshot.conn);
         if (err) {
             LOG_WRN("soft-off-plus: cmd 0x%02x write to peripheral %d failed (%d)", cmd, i, err);
         } else {

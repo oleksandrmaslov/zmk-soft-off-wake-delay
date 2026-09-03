@@ -30,8 +30,8 @@ config ZMK_SOFT_OFF_PLUS_BEHAVIOR
 
 config ZMK_SOFT_OFF_PLUS_SPLIT_SYNC
 	bool "Power off both split halves together"
-	depends on ZMK_SOFT_OFF_PLUS_BEHAVIOR && ZMK_SPLIT && BT
-	default y if ZMK_SPLIT
+	depends on ZMK_SOFT_OFF_PLUS_BEHAVIOR && ZMK_SPLIT_BLE && BT
+	default y if ZMK_SPLIT_BLE
 	help
 	  Triggering soft-off-plus on either half powers off both, via a dedicated
 	  GATT characteristic (the central writes an off command to its
